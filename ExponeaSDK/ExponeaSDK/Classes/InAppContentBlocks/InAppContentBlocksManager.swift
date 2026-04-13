@@ -7,7 +7,6 @@
 //
 
 import Foundation
-import AppTrackingTransparency
 import WebKit
 #if canImport(ExponeaSDKShared)
 import ExponeaSDKShared
