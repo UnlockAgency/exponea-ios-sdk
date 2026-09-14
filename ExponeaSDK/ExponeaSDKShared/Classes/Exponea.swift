@@ -9,9 +9,9 @@
 import Foundation
 
 public class Exponea {
-    public static let version = "4.1.0"
+    public static let version = "4.3.0"
     /// A logger used to log all messages from the SDK.
-    nonisolated(unsafe) public static var logger: Logger = Logger()
+    public static var logger: Logger = Logger()
 
     public static func isExponeaNotification(userInfo: [AnyHashable: Any]) -> Bool {
         return userInfo["source"] as? String == "xnpe_platform"

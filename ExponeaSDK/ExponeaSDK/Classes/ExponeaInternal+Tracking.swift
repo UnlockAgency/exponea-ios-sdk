@@ -146,7 +146,29 @@ extension ExponeaInternal {
     /// Tracks the push notification token to Exponea API with string.
     ///
     /// - Parameter token: String containing the push notification token.
+    ///                    Under `.everyLaunch`, only one automatic `notification_state`
+    ///                    is allowed per app run. Calling this method uses that allowance,
+    ///                    so the SDK will skip its own automatic track on subsequent init
+    ///                    or foreground checks until the app is restarted.
+    public func trackPushToken(_ token: String) {
+        trackPushTokenInternal(token)
+    }
+
+    /// Tracks the push notification token to Exponea API with string.
+    ///
+    /// - Parameter token: String containing the push notification token.
+    ///                    If nil, no `notification_state` event is tracked and an error is logged;
+    ///                    the existing push token is **not** deleted.
+    ///                    Under `.everyLaunch`, only one automatic `notification_state`
+    ///                    is allowed per app run. A non-nil call uses that allowance, so the SDK
+    ///                    will skip its own automatic track on subsequent init or foreground checks
+    ///                    until the app is restarted; a nil call does not.
+    @available(*, deprecated, message: "Please use trackPushToken(_ token: String) instead.")
     public func trackPushToken(_ token: String?) {
+        trackPushTokenInternal(token)
+    }
+
+    private func trackPushTokenInternal(_ token: String?) {
         executeSafelyWithDependencies { dependencies in
             guard dependencies.configuration.hasSufficientAuth else {
                 throw ExponeaError.authorizationInsufficient
@@ -154,11 +176,22 @@ extension ExponeaInternal {
             UNAuthorizationStatusProvider.current.isAuthorized { authorized in
                 // Do the actual tracking
                 self.executeSafely {
+                    guard !IntegrationManager.shared.isStopped else {
+                        Exponea.logger.log(.error, message: "trackPushToken failed, Exponea is stopped")
+                        return
+                    }
                     try dependencies.trackingManager.trackNotificationState(
                         pushToken: token,
                         isValid: authorized,
                         description: authorized ? "Permission granted" : "Permission denied"
                     )
+                    // trackNotificationState just logs and returns on a nil token (it does not
+                    // delete anything), so only mark the once-per-process `.everyLaunch` session as
+                    // satisfied when a token was actually sent — otherwise a nil-token call would
+                    // silently suppress the legitimate automatic track for the rest of the process.
+                    if token != nil {
+                        dependencies.notificationsManager.markEveryLaunchSessionTracked()
+                    }
                 }
             }
         }
@@ -366,6 +399,16 @@ extension ExponeaInternal {
 
     /// Handles push notification token registration - compared to trackPushToken respects requirePushAuthorization
     public func handlePushNotificationToken(token: String) {
+        // Persist the token to a crash-survivable buffer BEFORE going
+        // through `executeSafelyWithDependencies`. The existing
+        // `ExpoInitManager.actionBlocks` path handles the
+        // pre-init in-memory queue (fires after configure) but is lost
+        // on process crash; `PreInitTokenBuffer` covers that gap.
+        // Calls made post-configure still persist, which is harmless
+        // because `PushNotificationManager.init` only drains on startup.
+        if !isConfigured {
+            PreInitTokenBuffer.shared.buffer(token: token)
+        }
         executeSafelyWithDependencies { dependencies in
             dependencies.notificationsManager.handlePushTokenRegistered(token: token)
         }
@@ -373,6 +416,10 @@ extension ExponeaInternal {
 
     /// Handles push notification token registration - compared to trackPushToken respects requirePushAuthorization
     public func handlePushNotificationToken(deviceToken: Data) {
+        // See `handlePushNotificationToken(token:)`.
+        if !isConfigured {
+            PreInitTokenBuffer.shared.buffer(token: deviceToken.tokenString)
+        }
         executeSafelyWithDependencies { dependencies in
             dependencies.notificationsManager.handlePushTokenRegistered(
                 dataObject: deviceToken as AnyObject?
@@ -393,13 +440,42 @@ extension ExponeaInternal {
     }
 
     /// This method can be used to manually flush all available data to Exponea.
+    /// Once the SDK is configured and not concurrently being stopped, the completion is always
+    /// invoked on the main thread on the happy data-upload path and on the public-API
+    /// short-circuit paths (SDK stopped, prior internal exception, insufficient authorization).
+    /// The existing flushing-pipeline short-circuits (no internet, already in progress, empty
+    /// queue) continue to deliver their typed `FlushResult` cases. On the public-API
+    /// short-circuits no flush is performed and `FlushResult.error(_:)` carries the underlying
+    /// `ExponeaError` so callers (including wrapper SDKs) can diagnose the cause.
+    /// Calls placed before `configure(...)` finishes are queued; the callback fires when
+    /// configuration completes if the deferred call succeeds. Deferred failures (insufficient
+    /// authorization, prior internal exception, NSException during deferred execution) are
+    /// logged via `Exponea.logger` and may not surface in the callback.
     public func flushData(completion: ((FlushResult) -> Void)?) {
-        executeSafelyWithDependencies { dependencies in
+        if IntegrationManager.shared.isStopped {
+            Exponea.logger.log(.warning, message: "flushData skipped: SDK is stopped")
+            DispatchQueue.main.async { completion?(.error(ExponeaError.isStopped)) }
+            return
+        }
+        executeSafelyWithDependencies({ dependencies, _ in
             guard dependencies.configuration.hasSufficientAuth else {
                 throw ExponeaError.authorizationInsufficient
             }
-            dependencies.flushingManager.flushData(completion: completion)
-        }
+            // Trampoline the inner completion onto the main queue so callers see a single,
+            // consistent threading contract regardless of which internal short-circuit the
+            // flushing pipeline takes (caller thread, background reachability check, etc.).
+            // Normalize the inner stopped-state ExponeaError so the public API exposes a single
+            // case (`.isStopped`) regardless of which guard caught the stopped flag first.
+            dependencies.flushingManager.flushData(completion: { result in
+                let normalized: FlushResult
+                if case .error(let err as ExponeaError) = result, case .stoppedProcess = err {
+                    normalized = .error(ExponeaError.isStopped)
+                } else {
+                    normalized = result
+                }
+                DispatchQueue.main.async { completion?(normalized) }
+            })
+        }, completion: flushDataSafetyHandler(completion: completion))
     }
 
     // MARK: Anonymize
@@ -412,17 +488,30 @@ extension ExponeaInternal {
 
     /// Anonymizes the user with an optional completion callback.
     /// In Stream mode, pending events are flushed with the current JWT before the identity is cleared.
-    /// The completion is called on the main thread once the anonymize (and optional flush) finishes.
+    /// Once the SDK is configured and not concurrently being stopped, the completion is always
+    /// invoked on the main thread on the happy path (after the anonymize and optional flush
+    /// finish) and on the public-API short-circuit paths (SDK stopped via `stopIntegration`,
+    /// prior internal exception). On the short-circuit paths no anonymize is performed and the
+    /// callback signals only that the call has been resolved.
+    /// Calls placed before `configure(...)` finishes are queued; the callback fires when
+    /// configuration completes if the deferred call succeeds. Deferred failures (prior internal
+    /// exception, NSException during deferred execution) are logged via `Exponea.logger` and may
+    /// not surface in the callback.
     public func anonymize(completion: (() -> Void)?) {
         Exponea.logger.log(.verbose, message: "Basic anonymisation requested")
-        executeSafelyWithDependencies { dependencies in
+        if IntegrationManager.shared.isStopped {
+            Exponea.logger.log(.warning, message: "anonymize skipped: SDK is stopped")
+            DispatchQueue.main.async { completion?() }
+            return
+        }
+        executeSafelyWithDependencies({ dependencies, _ in
             self.performAnonymize(
                 dependencies: dependencies,
                 exponeaIntegrationType: dependencies.configuration.mainProject,
                 exponeaProjectMapping: (dependencies.configuration.integrationConfig as? Exponea.ProjectSettings)?.projectMapping,
                 completion: completion
             )
-        }
+        }, completion: anonymizeSafetyHandler(completion: completion))
     }
 
     /// Anonymizes the user and starts tracking as if the app was just installed.
@@ -452,14 +541,93 @@ extension ExponeaInternal {
         exponeaIntegrationType: any ExponeaIntegrationType,
         exponeaProjectMapping: [EventType: [ExponeaProject]]? = nil
     ) {
+        anonymize(
+            exponeaIntegrationType: exponeaIntegrationType,
+            exponeaProjectMapping: exponeaProjectMapping,
+            completion: nil
+        )
+    }
+    
+    /// Use exponeaProjectMapping when integrating with project token, not stream ID.
+    /// Once the SDK is configured and not concurrently being stopped, the completion is always
+    /// invoked on the main thread on the happy path (after the anonymize and optional flush
+    /// finish) and on the public-API short-circuit paths (SDK stopped via `stopIntegration`,
+    /// prior internal exception). On the short-circuit paths no anonymize is performed and the
+    /// callback signals only that the call has been resolved.
+    /// Calls placed before `configure(...)` finishes are queued; the callback fires when
+    /// configuration completes if the deferred call succeeds. Deferred failures (prior internal
+    /// exception, NSException during deferred execution) are logged via `Exponea.logger` and may
+    /// not surface in the callback.
+    public func anonymize(
+        exponeaIntegrationType: any ExponeaIntegrationType,
+        exponeaProjectMapping: [EventType: [ExponeaProject]]? = nil,
+        completion: (() -> Void)?
+    ) {
         Exponea.logger.log(.verbose, message: "Anonymisation requested with \(exponeaIntegrationType) and \(String(describing: exponeaProjectMapping))")
-        executeSafelyWithDependencies { dependencies in
+        if IntegrationManager.shared.isStopped {
+            Exponea.logger.log(.warning, message: "anonymize skipped: SDK is stopped")
+            DispatchQueue.main.async { completion?() }
+            return
+        }
+        executeSafelyWithDependencies({ dependencies, _ in
             self.performAnonymize(
                 dependencies: dependencies,
                 exponeaIntegrationType: exponeaIntegrationType,
                 exponeaProjectMapping: exponeaProjectMapping,
-                completion: nil
+                completion: completion
             )
+        }, completion: anonymizeSafetyHandler(completion: completion))
+    }
+
+    /// Builds a safety completion handler for `flushData(completion:)` that delivers the user
+    /// completion on the main thread on every short-circuit path raised by
+    /// `executeSafelyWithDependencies<Bool>`. The `.success` branch is unreachable today
+    /// (`flushingManager.flushData` fires the user completion directly) but still delivers the
+    /// callback as a forward-compatibility safeguard.
+    private func flushDataSafetyHandler(
+        completion: ((FlushResult) -> Void)?
+    ) -> CompletionHandler<Bool> {
+        return { result in
+            switch result {
+            case .success:
+                Exponea.logger.log(
+                    .warning,
+                    message: "flushData: unexpected .success on safety completion handler"
+                )
+                DispatchQueue.main.async { completion?(.success(0)) }
+            case .failure(let error):
+                Exponea.logger.log(
+                    .warning,
+                    message: "flushData short-circuited: \(error.localizedDescription)"
+                )
+                DispatchQueue.main.async { completion?(.error(error)) }
+            }
+        }
+    }
+
+    /// Builds a safety completion handler for the `anonymize(...)` overloads that delivers the
+    /// user completion on the main thread on every short-circuit path raised by
+    /// `executeSafelyWithDependencies<Bool>`. The `.success` branch is unreachable today
+    /// (`performAnonymize` fires the user completion directly) but still delivers the callback
+    /// as a forward-compatibility safeguard.
+    private func anonymizeSafetyHandler(
+        completion: (() -> Void)?
+    ) -> CompletionHandler<Bool> {
+        return { result in
+            switch result {
+            case .success:
+                Exponea.logger.log(
+                    .warning,
+                    message: "anonymize: unexpected .success on safety completion handler"
+                )
+                DispatchQueue.main.async { completion?() }
+            case .failure(let error):
+                Exponea.logger.log(
+                    .warning,
+                    message: "anonymize short-circuited: \(error.localizedDescription)"
+                )
+                DispatchQueue.main.async { completion?() }
+            }
         }
     }
 
@@ -509,6 +677,20 @@ extension ExponeaInternal {
 
             self?.jwtAuthManager?.clearSync()
             Exponea.logger.log(.verbose, message: "JWT token cleared during anonymization")
+
+            // Opt-in regeneration of device_id (telemetry install ID) on anonymize().
+            // Placement: AFTER the old-profile invalidation notification_state was enqueued (above, with the
+            // old device_id frozen into its payload at TrackingManager.trackInternal enqueue time), and
+            // BEFORE the new-profile re-registration / install / session events fire inside trackingManager.anonymize.
+            // This preserves the contract: pre-anonymize invalidation carries the old device_id,
+            // post-anonymize events carry the new device_id.
+            if dependencies.configuration.regenerateDeviceIdOnAnonymize {
+                TelemetryUtility.clearInstallIdFromAllStores(appGroup: dependencies.configuration.appGroup)
+                Exponea.logger.log(
+                    .verbose,
+                    message: "Anonymisation: telemetry install ID (device_id) cleared (regenerateDeviceIdOnAnonymize=true)"
+                )
+            }
 
             do {
                 try dependencies.trackingManager.anonymize(

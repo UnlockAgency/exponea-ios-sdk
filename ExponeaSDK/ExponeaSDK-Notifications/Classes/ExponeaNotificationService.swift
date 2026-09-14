@@ -44,12 +44,25 @@ public class ExponeaNotificationService {
         self.appGroup = appGroup
         if let appGroup {
             let userDefaults = TelemetryUtility.getUserDefaults(appGroup: appGroup)
-            let installId = TelemetryUtility.getInstallId(userDefaults: userDefaults)
-            self.telemetry = SentryTelemetryUpload(installId: installId) {
-                Configuration.loadFromUserDefaults(appGroup: appGroup)
-            }
+            self.telemetry = SentryTelemetryUpload(
+                installIdProvider: { TelemetryUtility.getInstallId(userDefaults: userDefaults) },
+                configGetter: { Configuration.loadFromUserDefaults(appGroup: appGroup) }
+            )
         } else {
             self.telemetry = nil
+        }
+        // The NSE runs in a separate process from the main app, so it cannot
+        // inherit the DeliveryAuthorizationProvider that the host app's
+        // configure step installs. Without this install the provider would
+        // stay as the no-op default, which always returns `nil`, and the
+        // delivered-event resolver would fall back to the legacy `"shown"`
+        // string for every push — defeating the point of resolving the real
+        // notification state on the NSE path. The XCTest guard mirrors the
+        // host-side ExponeaInternal guard so test bundles keep the no-op
+        // default (UNUserNotificationCenter.current() is not safe to invoke
+        // without the UN entitlement; tests substitute their own provider).
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            DeliveryAuthorizationProvider.installProductionBackend()
         }
     }
 
@@ -145,20 +158,59 @@ public class ExponeaNotificationService {
                 bestAttemptContent?.sound = UNNotificationSound.init(named: UNNotificationSoundName(rawValue: sound))
             }
 
-            // Download and add image
+            // Download and add image.
+            // Animated attachments (GIF and extended WebP) must be saved with
+            // the .gif extension so that UNNotificationAttachment derives the
+            // correct UTI and does not transcode the bytes (which would strip
+            // animation data). WebP cannot use .webp — UNNotificationAttachment
+            // rejects it with error 101 "Unrecognized attachment file type" —
+            // but .gif is accepted and preserves the raw bytes on disk. The
+            // content extension detects the actual format via magic bytes.
             if let imagePath = content.userInfo["image"] as? String,
                 let url = imagePath.cleanedURL(),
-                let data = try? Data(contentsOf: url, options: []),
-                let attachment = saveImage("image.png", data: data, options: nil) {
-                bestAttemptContent?.attachments = [attachment]
+                let data = try? Data(contentsOf: url, options: []) {
+                let filename = (data.isGif || data.isExtendedWebP) ? "image.gif" : "image.png"
+                if let attachment = saveImage(filename, data: data, options: nil) {
+                    bestAttemptContent?.attachments = [attachment]
+                }
             }
         }
         contentCreated = true
     }
 
     func trackDeliveredNotification(appGroup: String, notificationData: NotificationData) {
+        // Resolve the current UN authorization + alert setting before building
+        // the delivered event, so the emitted `state` property reflects whether
+        // the push was actually surfaced to the user instead of the previous
+        // hardcoded `"shown"`. The NSE runs in a separate process with a tight
+        // time budget, but `getNotificationSettings` is a fast, local call and
+        // the rest of `trackDeliveredNotification` is already callback-driven,
+        // so the added async hop is a natural fit.
+        DeliveryAuthorizationProvider.current.currentDeliveryAuthorization { [weak self] snapshot in
+            guard let self else { return }
+            let state = DeliveredNotificationStateResolver.resolve(
+                authorization: snapshot,
+                silent: false
+            )
+            self.performTrackDeliveredNotification(
+                appGroup: appGroup,
+                notificationData: notificationData,
+                state: state
+            )
+        }
+    }
+
+    private func performTrackDeliveredNotification(
+        appGroup: String,
+        notificationData: NotificationData,
+        state: String
+    ) {
         do {
-            let deliveredTracker = try DeliveredNotificationTracker(appGroup: appGroup, notificationData: notificationData)
+            let deliveredTracker = try DeliveredNotificationTracker(
+                appGroup: appGroup,
+                notificationData: notificationData,
+                state: state
+            )
             deliveredTracker.track(
                 onSuccess: {
                     self.notificationDeliveryTracked = true
